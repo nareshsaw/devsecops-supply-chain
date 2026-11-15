@@ -1,0 +1,167 @@
+name: secure-supply-chain
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  GITLEAKS_VERSION: 8.30.1
+  CONFTEST_VERSION: 0.71.1
+  KYVERNO_VERSION: 1.20.0
+
+jobs:
+  # 1. Secret scanning: block committed credentials
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          sudo mv gitleaks /usr/local/bin/
+      - name: Scan git history for secrets
+        run: gitleaks git . --no-banner --redact --verbose
+
+  # 2. Unit tests, SAST and dependency vulnerability scanning
+  test-and-sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Unit tests
+        run: pytest -q
+      - name: SAST (Bandit)
+        run: bandit -r app -ll
+      - name: Dependency scan (pip-audit)
+        run: pip-audit -r app/requirements.txt
+
+  # 3. Policy-as-code in CI (shift-left): OPA/Rego via conftest + Kyverno CLI tests
+  policy-as-code:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install conftest and Kyverno CLI
+        run: |
+          curl -sSL "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" | tar -xz conftest
+          curl -sSL "https://github.com/kyverno/kyverno/releases/download/v${KYVERNO_VERSION}/kyverno-cli_v${KYVERNO_VERSION}_linux_x86_64.tar.gz" | tar -xz kyverno
+          sudo mv conftest kyverno /usr/local/bin/
+      - name: OPA - Kubernetes manifest must pass
+        run: conftest test k8s/deployment.yaml -p policy/conftest --namespace main
+      - name: OPA - insecure manifest must be rejected
+        run: |
+          if conftest test k8s/bad-deployment.yaml -p policy/conftest --namespace main; then
+            echo "::error::Insecure manifest was NOT rejected"; exit 1
+          fi
+      - name: OPA - Dockerfile best practices
+        run: conftest test Dockerfile -p policy/conftest --namespace dockerfile
+      - name: Kyverno policy unit tests
+        run: kyverno test policy/kyverno/tests
+
+  # 4. Build, scan, generate SBOM, sign, attest provenance (main branch only)
+  build-scan-sign:
+    if: github.event_name == 'push'
+    needs: [secrets-scan, test-and-sast, policy-as-code]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # push to GitHub Container Registry
+      id-token: write          # keyless signing with Sigstore (OIDC)
+      attestations: write      # build provenance
+      security-events: write   # upload scan results to the Security tab
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:1.0.0
+
+      - name: Vulnerability scan (Grype)
+        id: scan
+        uses: anchore/scan-action@v7
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          severity-cutoff: critical
+          only-fixed: true
+          fail-build: true
+      - name: Upload scan results
+        if: always() && steps.scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+
+      - name: Generate SBOM (Syft, SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image (keyless, Sigstore)
+        run: cosign sign --yes "${IMAGE}@${{ steps.build.outputs.digest }}"
+      - name: Attach SBOM as a signed attestation
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+      - name: Build provenance (SLSA)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify signature before release
+        run: |
+          cosign verify "${IMAGE}@${{ steps.build.outputs.digest }}" \
+            --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+  # 5. Admission control: Kyverno enforces the same guardrails inside a real cluster
+  admission-control:
+    needs: [policy-as-code]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: devsecops
+      - name: Install Kyverno
+        run: |
+          helm repo add kyverno https://kyverno.github.io/kyverno/
+          helm repo update
+          helm install kyverno kyverno/kyverno -n kyverno --create-namespace --wait --timeout 5m
+      - name: Apply guardrail policies
+        run: |
+          for i in 1 2 3 4 5 6; do kubectl apply -f policy/kyverno/ && break; echo "Kyverno not ready, retrying"; sleep 10; done
+          sleep 20
+          kubectl get validatingpolicies
+      - name: Compliant deployment is admitted
+        run: kubectl apply --dry-run=server -f k8s/deployment.yaml
+      - name: Insecure deployment is blocked
+        run: |
+          if kubectl apply --dry-run=server -f k8s/bad-deployment.yaml; then
+            echo "::error::Insecure deployment was admitted"; exit 1
+          fi
+          echo "Blocked as expected"

@@ -1,0 +1,18 @@
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: guardrail-tests
+policies:
+  - ../disallow-latest-tag.yaml
+  - ../require-non-root.yaml
+  - ../require-resource-limits.yaml
+resources:
+  - good.yaml
+  - bad.yaml
+results:
+  - { isValidatingPolicy: true, kind: Deployment, policy: disallow-latest-tag, resources: [devsecops-demo], result: pass }
+  - { isValidatingPolicy: true, kind: Deployment, policy: disallow-latest-tag, resources: [insecure-demo], result: fail }
+  - { isValidatingPolicy: true, kind: Deployment, policy: require-non-root, resources: [devsecops-demo], result: pass }
+  - { isValidatingPolicy: true, kind: Deployment, policy: require-non-root, resources: [insecure-demo], result: fail }
+  - { isValidatingPolicy: true, kind: Deployment, policy: require-resource-limits, resources: [devsecops-demo], result: pass }
+  - { isValidatingPolicy: true, kind: Deployment, policy: require-resource-limits, resources: [insecure-demo], result: fail }

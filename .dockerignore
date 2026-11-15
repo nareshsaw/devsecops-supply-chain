@@ -1,0 +1,6 @@
+.git
+.github
+tests
+policy
+k8s
+*.md

@@ -1,0 +1,29 @@
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: require-non-root
+  annotations:
+    policies.kyverno.io/description: Pods must run as non-root and containers must not be privileged.
+spec:
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: [deployments, statefulsets, daemonsets, jobs]
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [CREATE, UPDATE]
+        resources: [pods]
+  variables:
+    - name: ctnrs
+      expression: >-
+        object.spec.containers + object.spec.?initContainers.orValue([])
+  validations:
+    - expression: >-
+        object.spec.?securityContext.?runAsNonRoot.orValue(false) == true ||
+        variables.ctnrs.all(c, c.?securityContext.?runAsNonRoot.orValue(false) == true)
+      message: "Pods must set securityContext.runAsNonRoot: true."
+    - expression: >-
+        variables.ctnrs.all(c, c.?securityContext.?privileged.orValue(false) == false)
+      message: "Privileged containers are not allowed."
